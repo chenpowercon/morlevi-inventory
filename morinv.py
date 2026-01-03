@@ -19,13 +19,15 @@ MORLEVI_PASS = os.environ.get("MORLEVI_PASS")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
 SHOPIFY_STORE_URL = "360-pro.myshopify.com"
-VENDOR_NAME = "Morlevi"
 START_URL = "https://www.morlevi.co.il/AllProductsPrices/17,82,6,169,7,95,64,1,4,156,8,308,368,436,106,110,115,135,271,362?percent="
 HOME_URL = "https://www.morlevi.co.il"
+
+# הגדרות סינון קריטיות
+VENDOR_NAME = "Morlevi"  # חייב להיות זהה לשם הספק בשופיפיי
+TARGET_TAG = "MOR"       # חייב להיות זהה לתגית בשופיפיי
 # ==========================================
 
 def init_driver():
-    """הגדרות דפדפן מותאמות ל-Docker/Render"""
     options = Options()
     options.add_argument("--no-sandbox")
     options.add_argument("--headless") 
@@ -77,10 +79,10 @@ def login_to_morlevi(driver):
     return False
 
 def fetch_shopify_inventory_map():
-    print("⏳ טוען תמונת מצב משופיפיי...")
+    print("⏳ טוען תמונת מצב משופיפיי (כולל תגיות וספק)...")
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/products.json"
     headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN}
-    params = {"limit": 250, "fields": "id,vendor,variants"}
+    params = {"limit": 250, "fields": "id,tags,vendor,variants"}
     
     inventory_map = {}
     
@@ -93,16 +95,18 @@ def fetch_shopify_inventory_map():
             
             data = r.json()
             for prod in data.get("products", []):
+                tags = prod.get("tags", "")
                 vendor = prod.get("vendor", "")
+                
                 for variant in prod.get("variants", []):
                     sku = str(variant.get("sku")).strip()
                     if sku:
-                        # שומרים גם את inventory_item_id כדי לעדכן עלות בהמשך
                         inventory_map[sku] = {
                             "variant_id": variant["id"],
-                            "inventory_item_id": variant["inventory_item_id"], # שדה קריטי לעלות
+                            "inventory_item_id": variant["inventory_item_id"],
                             "price": variant["price"],
                             "qty": variant["inventory_quantity"],
+                            "tags": tags,
                             "vendor": vendor
                         }
             
@@ -125,26 +129,23 @@ def fetch_shopify_inventory_map():
     return inventory_map
 
 def update_shopify_variant(variant_id, new_price, new_qty):
-    """מעדכן מחיר מכירה ומלאי"""
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/variants/{variant_id}.json"
     headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json"}
     payload = {"variant": {"id": variant_id, "price": new_price, "inventory_quantity": new_qty}}
     try:
         r = requests.put(url, json=payload, headers=headers)
-        if r.status_code == 429: # Rate limit
+        if r.status_code == 429:
             time.sleep(2)
             return update_shopify_variant(variant_id, new_price, new_qty)
         return r.status_code == 200
     except: return False
 
 def update_shopify_cost(inventory_item_id, cost_price):
-    """מעדכן את מחיר העלות (Cost per item)"""
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_items/{inventory_item_id}.json"
     headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json"}
     payload = {"inventory_item": {"id": inventory_item_id, "cost": cost_price}}
     try:
         r = requests.put(url, json=payload, headers=headers)
-        # לא מחזירים שגיאה אם נכשל, כי זה משני לעדכון המלאי
         if r.status_code == 429:
             time.sleep(1)
             requests.put(url, json=payload, headers=headers)
@@ -161,14 +162,14 @@ def get_stock_level(text):
 
 def sync_products():
     if not SHOPIFY_ACCESS_TOKEN:
-        print("❌ שגיאה: חסר טוקן שופיפיי במשתני הסביבה")
+        print("❌ שגיאה: חסר טוקן שופיפיי")
         return
 
     driver = init_driver()
     try:
         if not login_to_morlevi(driver): return
 
-        # 1. טעינת שופיפיי
+        # 1. טעינת נתונים משופיפיי
         shopify_map = fetch_shopify_inventory_map()
         if not shopify_map: return
 
@@ -187,13 +188,12 @@ def sync_products():
         zeroed_count = 0
         found_skus_on_site = set()
 
-        # 3. לולאת עדכון
+        # 3. לולאת עדכון (עוברת על המוצרים שנמצאו באתר)
         for i, link in enumerate(links):
             try:
                 driver.get(link)
                 clean_ui(driver)
                 
-                # חילוץ SKU
                 sku = ""
                 try: sku = driver.find_element(By.CSS_SELECTOR, ".sku-copy:not(.ltr)").get_attribute("data-sku")
                 except: pass
@@ -206,7 +206,13 @@ def sync_products():
                 
                 if sku not in shopify_map: continue
 
-                # נתונים מהאתר
+                # בדיקות מקדימות לחיסכון בזמן
+                curr = shopify_map[sku]
+                
+                # בודקים אם המוצר הוא של Morlevi ואם יש לו תגית MOR
+                if curr['vendor'] != VENDOR_NAME or TARGET_TAG not in curr['tags']:
+                    continue
+
                 supplier_price_raw = 0
                 try:
                     p_text = driver.find_element(By.ID, "basicPrice").text
@@ -219,17 +225,11 @@ def sync_products():
                     supplier_qty = get_stock_level(stock_text)
                 except: pass
 
-                # חישוב והשוואה
                 final_price = str(calculate_morlevi_price(supplier_price_raw))
-                curr = shopify_map[sku]
                 
-                # בדיקה אם צריך לעדכן (מחיר מכירה שונה או מלאי שונה)
                 if float(final_price) != float(curr["price"]) or supplier_qty != int(curr["qty"]):
                     print(f"[{i+1}] ♻️ מעדכן {sku}: מחיר {curr['price']}->{final_price}, מלאי {curr['qty']}->{supplier_qty}")
-                    
-                    # עדכון מחיר מכירה ומלאי
                     if update_shopify_variant(curr["variant_id"], final_price, supplier_qty):
-                        # אם העדכון הצליח, מעדכנים גם את ה-COST (מחיר העלות מהספק)
                         if supplier_price_raw > 0:
                             update_shopify_cost(curr["inventory_item_id"], supplier_price_raw)
                         updated_count += 1
@@ -237,13 +237,21 @@ def sync_products():
             except Exception as e:
                 print(f"⚠️ שגיאה במוצר {i}: {e}")
 
-        # 4. איפוס מוצרים שנעלמו (Zero Out)
-        print("\n🧹 בודק מוצרים שנעלמו מהספק...")
+        # 4. איפוס מוצרים שנעלמו (Zero Out) - לוגיקה משולבת
+        print("\n🧹 בודק מוצרים (Morlevi + תגית MOR) שנעלמו מהספק...")
         for sku, data in shopify_map.items():
-            if data['vendor'] != VENDOR_NAME: continue
             
+            # תנאי 1: הספק הוא Morlevi
+            if data['vendor'] != VENDOR_NAME:
+                continue
+            
+            # תנאי 2: יש תגית MOR
+            if TARGET_TAG not in data['tags']:
+                continue
+            
+            # תנאי 3: לא נמצא בסריקה + יש מלאי
             if sku not in found_skus_on_site and int(data['qty']) > 0:
-                print(f"   🚫 מוצר {sku} לא נמצא באתר. מאפס מלאי.")
+                print(f"   🚫 מוצר {sku} נעלם מהספק. מאפס מלאי.")
                 if update_shopify_variant(data['variant_id'], data['price'], 0):
                     zeroed_count += 1
 
