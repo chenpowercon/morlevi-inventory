@@ -26,4 +26,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # הפקודה להרצת הסקריפט שלך
-CMD ["python", "MORINV.py"]
+CMD ["python", "morinv.py"]
+
