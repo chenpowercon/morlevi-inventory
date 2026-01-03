@@ -1,0 +1,37 @@
+name: Daily Inventory Sync
+
+on:
+  schedule:
+    # רץ כל יום ב-22:00 UTC (שזה חצות שעון ישראל)
+    - cron: '0 22 * * *'
+  # מאפשר לך להריץ ידנית בלחיצת כפתור לבדיקה
+  workflow_dispatch:
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Script
+        env:
+          MORLEVI_USER: ${{ secrets.MORLEVI_USER }}
+          MORLEVI_PASS: ${{ secrets.MORLEVI_PASS }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+        run: python MORINV.py
