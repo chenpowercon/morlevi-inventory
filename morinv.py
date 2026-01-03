@@ -14,12 +14,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= הגדרות =================
-# הנתונים נמשכים מהגדרות השרת ב-Render (ראה הוראות למטה)
 MORLEVI_USER = os.environ.get("MORLEVI_USER")
 MORLEVI_PASS = os.environ.get("MORLEVI_PASS")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
 
-# הגדרות קבועות שהכנסת
 SHOPIFY_STORE_URL = "360-pro.myshopify.com"
 VENDOR_NAME = "Morlevi"
 START_URL = "https://www.morlevi.co.il/AllProductsPrices/17,82,6,169,7,95,64,1,4,156,8,308,368,436,106,110,115,135,271,362?percent="
@@ -30,7 +28,7 @@ def init_driver():
     """הגדרות דפדפן מותאמות ל-Docker/Render"""
     options = Options()
     options.add_argument("--no-sandbox")
-    options.add_argument("--headless") # חובה בשרת
+    options.add_argument("--headless") 
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
@@ -90,7 +88,7 @@ def fetch_shopify_inventory_map():
         try:
             r = requests.get(url, headers=headers, params=params)
             if r.status_code != 200:
-                print(f⚠️ שגיאת שופיפיי: {r.status_code}")
+                print(f"⚠️ שגיאת שופיפיי: {r.status_code}")
                 break
             
             data = r.json()
@@ -99,8 +97,10 @@ def fetch_shopify_inventory_map():
                 for variant in prod.get("variants", []):
                     sku = str(variant.get("sku")).strip()
                     if sku:
+                        # שומרים גם את inventory_item_id כדי לעדכן עלות בהמשך
                         inventory_map[sku] = {
                             "variant_id": variant["id"],
+                            "inventory_item_id": variant["inventory_item_id"], # שדה קריטי לעלות
                             "price": variant["price"],
                             "qty": variant["inventory_quantity"],
                             "vendor": vendor
@@ -125,6 +125,7 @@ def fetch_shopify_inventory_map():
     return inventory_map
 
 def update_shopify_variant(variant_id, new_price, new_qty):
+    """מעדכן מחיר מכירה ומלאי"""
     url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/variants/{variant_id}.json"
     headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json"}
     payload = {"variant": {"id": variant_id, "price": new_price, "inventory_quantity": new_qty}}
@@ -135,6 +136,19 @@ def update_shopify_variant(variant_id, new_price, new_qty):
             return update_shopify_variant(variant_id, new_price, new_qty)
         return r.status_code == 200
     except: return False
+
+def update_shopify_cost(inventory_item_id, cost_price):
+    """מעדכן את מחיר העלות (Cost per item)"""
+    url = f"https://{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_items/{inventory_item_id}.json"
+    headers = {"X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json"}
+    payload = {"inventory_item": {"id": inventory_item_id, "cost": cost_price}}
+    try:
+        r = requests.put(url, json=payload, headers=headers)
+        # לא מחזירים שגיאה אם נכשל, כי זה משני לעדכון המלאי
+        if r.status_code == 429:
+            time.sleep(1)
+            requests.put(url, json=payload, headers=headers)
+    except: pass
 
 def calculate_morlevi_price(raw_price):
     if raw_price < 300: return round((raw_price + 50) * 1.18)
@@ -162,7 +176,6 @@ def sync_products():
         print(f"🔄 סורק את הכתובת: {START_URL}")
         driver.get(START_URL)
         time.sleep(5)
-        # גלילה ארוכה לטעינת כל המוצרים
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(3)
         
@@ -191,14 +204,13 @@ def sync_products():
                 
                 if sku: found_skus_on_site.add(sku)
                 
-                # אם לא קיים בשופיפיי, מדלגים
                 if sku not in shopify_map: continue
 
                 # נתונים מהאתר
-                supplier_price = 0
+                supplier_price_raw = 0
                 try:
                     p_text = driver.find_element(By.ID, "basicPrice").text
-                    supplier_price = float(re.sub(r"[^\d.]", "", p_text))
+                    supplier_price_raw = float(re.sub(r"[^\d.]", "", p_text))
                 except: pass
                 
                 supplier_qty = 0
@@ -208,23 +220,28 @@ def sync_products():
                 except: pass
 
                 # חישוב והשוואה
-                final_price = str(calculate_morlevi_price(supplier_price))
+                final_price = str(calculate_morlevi_price(supplier_price_raw))
                 curr = shopify_map[sku]
                 
+                # בדיקה אם צריך לעדכן (מחיר מכירה שונה או מלאי שונה)
                 if float(final_price) != float(curr["price"]) or supplier_qty != int(curr["qty"]):
                     print(f"[{i+1}] ♻️ מעדכן {sku}: מחיר {curr['price']}->{final_price}, מלאי {curr['qty']}->{supplier_qty}")
+                    
+                    # עדכון מחיר מכירה ומלאי
                     if update_shopify_variant(curr["variant_id"], final_price, supplier_qty):
+                        # אם העדכון הצליח, מעדכנים גם את ה-COST (מחיר העלות מהספק)
+                        if supplier_price_raw > 0:
+                            update_shopify_cost(curr["inventory_item_id"], supplier_price_raw)
                         updated_count += 1
+                        
             except Exception as e:
                 print(f"⚠️ שגיאה במוצר {i}: {e}")
 
         # 4. איפוס מוצרים שנעלמו (Zero Out)
         print("\n🧹 בודק מוצרים שנעלמו מהספק...")
         for sku, data in shopify_map.items():
-            # רק מוצרים של Morlevi
             if data['vendor'] != VENDOR_NAME: continue
             
-            # אם המוצר לא ברשימה שמצאנו הרגע באתר + המלאי שלו חיובי
             if sku not in found_skus_on_site and int(data['qty']) > 0:
                 print(f"   🚫 מוצר {sku} לא נמצא באתר. מאפס מלאי.")
                 if update_shopify_variant(data['variant_id'], data['price'], 0):
