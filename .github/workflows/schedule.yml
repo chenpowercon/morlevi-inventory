@@ -34,4 +34,4 @@ jobs:
           MORLEVI_USER: ${{ secrets.MORLEVI_USER }}
           MORLEVI_PASS: ${{ secrets.MORLEVI_PASS }}
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-        run: python MORINV.py
+        run: python morinv.py
